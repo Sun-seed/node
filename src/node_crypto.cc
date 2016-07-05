@@ -39,6 +39,9 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include <cstring>
+#include <iostream>
+
 #if defined(_MSC_VER)
 #define strcasecmp _stricmp
 #endif
@@ -72,6 +75,9 @@ static const int X509_NAME_FLAGS = ASN1_STRFLGS_ESC_CTRL
                                  | ASN1_STRFLGS_UTF8_CONVERT
                                  | XN_FLAG_SEP_MULTILINE
                                  | XN_FLAG_FN_SN;
+
+ENGINE* engine = NULL;
+unsigned int drapeau = ENGINE_METHOD_ALL;  // default value
 
 namespace node {
 
@@ -457,36 +463,71 @@ void SecureContext::SetKey(const FunctionCallbackInfo<Value>& args) {
   SecureContext* sc = Unwrap<SecureContext>(args.Holder());
 
   unsigned int len = args.Length();
-  if (len != 1 && len != 2) {
+  if (len != 1 && len != 2 && len != 3) {
     return env->ThrowTypeError("Bad parameter");
   }
   if (len == 2 && !args[1]->IsString()) {
     return env->ThrowTypeError("Bad parameter");
   }
 
-  BIO *bio = LoadBIO(env, args[0]);
-  if (!bio)
-    return;
-
-  node::Utf8Value passphrase(args[1]);
-
-  EVP_PKEY* key = PEM_read_bio_PrivateKey(bio,
-                                          NULL,
-                                          CryptoPemCallback,
-                                          len == 1 ? NULL : *passphrase);
-
-  if (!key) {
-    BIO_free_all(bio);
-    unsigned long err = ERR_get_error();
-    if (!err) {
-      return env->ThrowError("PEM_read_bio_PrivateKey");
+  if (engine == NULL && len == 3) {
+    int err = ERR_get_error();
+    if (err == 0) {
+      char tmp[1024];
+      snprintf(tmp, sizeof(tmp), "Engine not set, call crypto.setEngine() if useEngine option is true\n");
+      return env->ThrowError(tmp);
+    } else {
+      return ThrowCryptoError(env, err);
     }
-    return ThrowCryptoError(env, err);
+}
+
+  v8::String::Utf8Value keyID(args[0]);
+  v8::String::Utf8Value pin(args[1]);
+
+  if(args[1]->BooleanValue()){
+    if( !ENGINE_ctrl_cmd_string(engine, "PIN", *pin, 0) )
+    //error message;
+      printf("PIN code error\n");
   }
 
-  SSL_CTX_use_PrivateKey(sc->ctx_, key);
-  EVP_PKEY_free(key);
-  BIO_free_all(bio);
+  if(len != 3){
+    BIO *bio = LoadBIO(env, args[0]);
+    if (!bio)
+      return;
+
+    node::Utf8Value passphrase(args[1]);
+
+    EVP_PKEY* key = PEM_read_bio_PrivateKey(bio,
+                                            NULL,
+                                            CryptoPemCallback,
+                                            len == 1 ? NULL : *passphrase);
+
+    if (!key) {
+      BIO_free_all(bio);
+      unsigned long err = ERR_get_error();
+      if (!err) {
+        return env->ThrowError("PEM_read_bio_PrivateKey");
+      }
+      return ThrowCryptoError(env, err);
+    }
+
+    SSL_CTX_use_PrivateKey(sc->ctx_, key);
+    EVP_PKEY_free(key);
+    BIO_free_all(bio);
+  }else{ // with engine
+    //printf("engine id is : %s\n", ENGINE_get_id(engine));
+    int r = ENGINE_set_default(engine, drapeau);
+    if (r == 0)
+      return ThrowCryptoError(env, ERR_get_error());
+    EVP_PKEY *pkey = ENGINE_load_private_key(engine, *keyID, NULL, NULL);
+    SSL_CTX_use_PrivateKey(sc->ctx_, pkey);
+
+    EVP_PKEY_free(pkey);
+    //Release the structural reference from ENGINE_by_id()
+    ENGINE_free(engine);
+    //Release the functional reference from ENGINE_init()
+    ENGINE_finish(engine);
+  }
 }
 
 
@@ -5085,27 +5126,49 @@ void InitCryptoOnce() {
 #endif  // !OPENSSL_NO_ENGINE
 }
 
-
 #ifndef OPENSSL_NO_ENGINE
 void SetEngine(const FunctionCallbackInfo<Value>& args) {
   Environment* env = Environment::GetCurrent(args.GetIsolate());
-  CHECK(args.Length() >= 2 && args[0]->IsString());
+  CHECK(args.Length() >= 3 && args[0]->IsString() && args[2]->IsString());
   unsigned int flags = args[1]->Uint32Value();
-
+  drapeau = flags;
   ClearErrorOnReturn clear_error_on_return;
   (void) &clear_error_on_return;  // Silence compiler warning.
 
   const node::Utf8Value engine_id(args[0]);
-  ENGINE* engine = ENGINE_by_id(*engine_id);
-
+  const node::Utf8Value module_id(args[2]);
+  v8::String::Utf8Value param(args[2]->ToString());
+  //ENGINE_load_dynamic();
+  //ENGINE* engine = NULL; //ENGINE_by_id(*engine_id);
   // Engine not found, try loading dynamically
   if (engine == NULL) {
+    //printf("Loading openssl engine dynamically!!!\n");
     engine = ENGINE_by_id("dynamic");
     if (engine != NULL) {
-      if (!ENGINE_ctrl_cmd_string(engine, "SO_PATH", *engine_id, 0) ||
-          !ENGINE_ctrl_cmd_string(engine, "LOAD", NULL, 0)) {
-        ENGINE_free(engine);
-        engine = NULL;
+      char str[30];
+      strcpy(str, *param); // convert Local String to const char *
+      //printf("dynamic engine not null %s\n", str);
+      
+      if(strcmp(str,"default")){ // if a module file is provided
+        printf("loading idprime pkcs11 module...");
+        if (!ENGINE_ctrl_cmd_string(engine, "SO_PATH", *engine_id, 0) ||       
+            !ENGINE_ctrl_cmd_string(engine, "LIST_ADD", "1", 0) ||
+            !ENGINE_ctrl_cmd_string(engine, "ID", "pkcs11", 0) ||
+            !ENGINE_ctrl_cmd_string(engine, "LOAD", NULL, 0) ||
+            !ENGINE_ctrl_cmd_string(engine, "MODULE_PATH", *module_id, 0)            
+            ){
+              printf(" Fail");
+              ENGINE_free(engine);
+              engine = NULL;
+        }else
+          printf(" Success\n"); // to be deleted later
+      }else{
+        if (!ENGINE_ctrl_cmd_string(engine, "SO_PATH", *engine_id, 0) ||       
+            !ENGINE_ctrl_cmd_string(engine, "LOAD", NULL, 0)
+          ){
+            ENGINE_free(engine);
+            engine = NULL;
+        }
       }
     }
   }
@@ -5120,11 +5183,16 @@ void SetEngine(const FunctionCallbackInfo<Value>& args) {
       return ThrowCryptoError(env, err);
     }
   }
+  //initialisation of engine 
+  if (!ENGINE_init(engine)){   
+      //handleErrors();
+      printf("Load error");   
+  }
 
-  int r = ENGINE_set_default(engine, flags);
+  //int r = ENGINE_set_default(engine, flags);
+  //Release the structural reference from ENGINE_by_id()
   ENGINE_free(engine);
-  if (r == 0)
-    return ThrowCryptoError(env, ERR_get_error());
+
 }
 #endif  // !OPENSSL_NO_ENGINE
 
